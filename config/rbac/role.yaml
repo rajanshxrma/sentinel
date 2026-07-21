@@ -5,6 +5,38 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - apps.sentinel.dev
   resources:
   - selfhealpolicies
@@ -20,11 +52,6 @@ rules:
   - apps.sentinel.dev
   resources:
   - selfhealpolicies/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - apps.sentinel.dev
-  resources:
   - selfhealpolicies/status
   verbs:
   - get
