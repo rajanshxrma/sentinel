@@ -85,6 +85,9 @@ func (r *SelfHealPolicyReconciler) now() time.Time {
 // triggers a rolling restart. Targets that exhaust their budget are
 // flipped to Degraded instead of being restarted forever.
 func (r *SelfHealPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	reconcileStart := time.Now()
+	defer func() { reconcileDuration.Observe(time.Since(reconcileStart).Seconds()) }()
+
 	log := logf.FromContext(ctx)
 	now := r.now()
 
@@ -175,6 +178,7 @@ func (r *SelfHealPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				r.Recorder.Eventf(&policy, corev1.EventTypeNormal, "Remediated",
 					"restarted deployment %s (restarts=%d, crashLoopBackOff=%t)",
 					deploy.Name, health.ObservedRestarts, health.CrashLoopBackOff)
+				remediationsTotal.WithLabelValues(policy.Namespace, policy.Name, deploy.Name).Inc()
 			}
 
 			r.Ledger.record(key, now)
@@ -208,6 +212,14 @@ func (r *SelfHealPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	policy.Status.Targets = newTargets
 	policy.Status.TotalRemediations += totalRemediationsDelta
 	policy.Status.ObservedGeneration = policy.Generation
+
+	var degradedCount int
+	for _, t := range newTargets {
+		if t.Phase == appsv1alpha1.TargetPhaseDegraded {
+			degradedCount++
+		}
+	}
+	targetsDegraded.WithLabelValues(policy.Namespace, policy.Name).Set(float64(degradedCount))
 
 	readyStatus := metav1.ConditionTrue
 	readyReason := "Reconciling"
