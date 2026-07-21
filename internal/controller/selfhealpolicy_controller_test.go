@@ -18,70 +18,247 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"sync/atomic"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	appsv1alpha1 "github.com/rajanshxrma/sentinel/api/v1alpha1"
 )
 
+const testNamespace = "default"
+
+var fixtureCounter int64
+
+// uniqueName returns a per-test-run unique name so parallel-safe It blocks
+// never collide on Deployment/ReplicaSet/Pod/SelfHealPolicy names.
+func uniqueName(prefix string) string {
+	n := atomic.AddInt64(&fixtureCounter, 1)
+	return fmt.Sprintf("%s-%d", prefix, n)
+}
+
+func int32Ptr(i int32) *int32 { return &i }
+
+// crashLoopingTarget creates a Deployment, a ReplicaSet controller-owned by
+// it, and a Pod controller-owned by that ReplicaSet whose sole container is
+// reported as CrashLoopBackOff with restartCount. There is no real
+// Deployment/ReplicaSet controller running in envtest, so the ownership
+// chain the reconciler walks is built by hand here.
+func crashLoopingTarget(ctx context.Context, name string, restartCount int32) *appsv1.Deployment {
+	labels := map[string]string{"app": name}
+
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, Labels: labels},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+			},
+		},
+	}
+	Expect(k8sClient.Create(ctx, deploy)).To(Succeed())
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name + "-rs",
+			Namespace:       testNamespace,
+			Labels:          labels,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(deploy, appsv1.SchemeGroupVersion.WithKind("Deployment"))},
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Replicas: int32Ptr(1),
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+			},
+		},
+	}
+	Expect(k8sClient.Create(ctx, rs)).To(Succeed())
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name + "-pod",
+			Namespace:       testNamespace,
+			Labels:          labels,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(rs, appsv1.SchemeGroupVersion.WithKind("ReplicaSet"))},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+
+	pod.Status = corev1.PodStatus{
+		Phase: corev1.PodRunning,
+		ContainerStatuses: []corev1.ContainerStatus{
+			{
+				Name:         "app",
+				RestartCount: restartCount,
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+				},
+			},
+		},
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+	return deploy
+}
+
+func deploymentAnnotation(ctx context.Context, name string) string {
+	var d appsv1.Deployment
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, &d)).To(Succeed())
+	return d.Spec.Template.Annotations[restartedAtAnnotation]
+}
+
 var _ = Describe("SelfHealPolicy Controller", func() {
-	Context("When reconciling a resource", func() {
-		const (
-			resourceName      = "test-resource"
-			resourceNamespace = "default"
-		)
+	ctx := context.Background()
 
-		ctx := context.Background()
+	Context("when a target breaches its failure threshold", func() {
+		It("patches restartedAt, increments TotalRemediations, and respects cooldown", func() {
+			name := uniqueName("remediate")
+			labels := map[string]string{"app": name}
 
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: resourceNamespace,
-		}
-		selfhealpolicy := &appsv1alpha1.SelfHealPolicy{}
+			deploy := crashLoopingTarget(ctx, name, 5)
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, deploy) })
 
-		BeforeEach(func() {
-			By("creating the custom resource for the Kind SelfHealPolicy")
-			err := k8sClient.Get(ctx, typeNamespacedName, selfhealpolicy)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &appsv1alpha1.SelfHealPolicy{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: resourceNamespace,
-					},
-					// TODO(user): Specify other spec details if needed.
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			policy := &appsv1alpha1.SelfHealPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+				Spec: appsv1alpha1.SelfHealPolicySpec{
+					Selector:          metav1.LabelSelector{MatchLabels: labels},
+					FailureThreshold:  2,
+					ObservationWindow: metav1.Duration{Duration: time.Minute},
+					Cooldown:          metav1.Duration{Duration: 3 * time.Second},
+					MaxRestarts:       5,
+					MaxRestartsWindow: metav1.Duration{Duration: time.Minute},
+				},
 			}
-		})
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, policy) })
 
-		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &appsv1alpha1.SelfHealPolicy{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
+			By("patching the deployment's restartedAt annotation")
+			Eventually(func(g Gomega) {
+				g.Expect(deploymentAnnotation(ctx, name)).NotTo(BeEmpty())
+			}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
 
-			By("Cleanup the specific resource instance SelfHealPolicy")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			By("incrementing status.totalRemediations")
+			Eventually(func(g Gomega) {
+				var p appsv1alpha1.SelfHealPolicy
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, &p)).To(Succeed())
+				g.Expect(p.Status.TotalRemediations).To(BeNumerically(">=", 1))
+			}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+
+			firstValue := deploymentAnnotation(ctx, name)
+			Expect(firstValue).NotTo(BeEmpty())
+
+			By("not patching again inside the cooldown window")
+			Consistently(func(g Gomega) {
+				g.Expect(deploymentAnnotation(ctx, name)).To(Equal(firstValue))
+			}, 2*time.Second, 250*time.Millisecond).Should(Succeed())
+
+			By("patching again once the cooldown has elapsed")
+			Eventually(func(g Gomega) {
+				g.Expect(deploymentAnnotation(ctx, name)).NotTo(Equal(firstValue))
+			}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
 		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &SelfHealPolicyReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
+	})
+
+	Context("when a target exhausts its remediation budget", func() {
+		It("flips to Degraded and stops remediating", func() {
+			name := uniqueName("degrade")
+			labels := map[string]string{"app": name}
+
+			deploy := crashLoopingTarget(ctx, name, 5)
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, deploy) })
+
+			policy := &appsv1alpha1.SelfHealPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+				Spec: appsv1alpha1.SelfHealPolicySpec{
+					Selector:          metav1.LabelSelector{MatchLabels: labels},
+					FailureThreshold:  2,
+					ObservationWindow: metav1.Duration{Duration: time.Minute},
+					Cooldown:          metav1.Duration{Duration: 1 * time.Second},
+					MaxRestarts:       2,
+					MaxRestartsWindow: metav1.Duration{Duration: time.Minute},
+				},
 			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, policy) })
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+			By("eventually marking the target Degraded once the budget is exhausted")
+			Eventually(func(g Gomega) {
+				var p appsv1alpha1.SelfHealPolicy
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, &p)).To(Succeed())
+				g.Expect(p.Status.Targets).NotTo(BeEmpty())
+				g.Expect(p.Status.Targets[0].Phase).To(Equal(appsv1alpha1.TargetPhaseDegraded))
+				g.Expect(apimeta.IsStatusConditionTrue(p.Status.Conditions, conditionTypeDegraded)).To(BeTrue())
+			}, 20*time.Second, 250*time.Millisecond).Should(Succeed())
+
+			finalValue := deploymentAnnotation(ctx, name)
+			var totalAtDegraded int64
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, &appsv1alpha1.SelfHealPolicy{})).To(Succeed())
+			{
+				var p appsv1alpha1.SelfHealPolicy
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, &p)).To(Succeed())
+				totalAtDegraded = p.Status.TotalRemediations
+			}
+			Expect(totalAtDegraded).To(BeNumerically(">=", 2))
+
+			By("not patching or remediating any further once degraded")
+			Consistently(func(g Gomega) {
+				g.Expect(deploymentAnnotation(ctx, name)).To(Equal(finalValue))
+				var p appsv1alpha1.SelfHealPolicy
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, &p)).To(Succeed())
+				g.Expect(p.Status.TotalRemediations).To(Equal(totalAtDegraded))
+				g.Expect(p.Status.Targets[0].Phase).To(Equal(appsv1alpha1.TargetPhaseDegraded))
+			}, 4*time.Second, 250*time.Millisecond).Should(Succeed())
+		})
+	})
+
+	Context("when dryRun is enabled", func() {
+		It("evaluates the target but never patches the deployment", func() {
+			name := uniqueName("dryrun")
+			labels := map[string]string{"app": name}
+
+			deploy := crashLoopingTarget(ctx, name, 5)
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, deploy) })
+
+			policy := &appsv1alpha1.SelfHealPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+				Spec: appsv1alpha1.SelfHealPolicySpec{
+					Selector:          metav1.LabelSelector{MatchLabels: labels},
+					FailureThreshold:  2,
+					ObservationWindow: metav1.Duration{Duration: time.Minute},
+					Cooldown:          metav1.Duration{Duration: 1 * time.Second},
+					MaxRestarts:       5,
+					MaxRestartsWindow: metav1.Duration{Duration: time.Minute},
+					DryRun:            true,
+				},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, policy) })
+
+			By("still reporting the target as unhealthy in status")
+			Eventually(func(g Gomega) {
+				var p appsv1alpha1.SelfHealPolicy
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, &p)).To(Succeed())
+				g.Expect(p.Status.Targets).NotTo(BeEmpty())
+				g.Expect(p.Status.Targets[0].Healthy).To(BeFalse())
+			}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+
+			By("never patching the deployment")
+			Consistently(func(g Gomega) {
+				g.Expect(deploymentAnnotation(ctx, name)).To(BeEmpty())
+			}, 3*time.Second, 250*time.Millisecond).Should(Succeed())
 		})
 	})
 })
