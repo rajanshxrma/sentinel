@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -62,7 +63,12 @@ var _ = BeforeSuite(func() {
 	}
 
 	By("building the manager image")
-	buildCmd := exec.Command("docker", "build", "--platform", "linux/arm64", "-t", e2eImage, ".")
+	// runtime.GOARCH matches Docker's platform arch naming directly (arm64
+	// on Apple Silicon dev machines, amd64 on GitHub Actions runners), so
+	// the built image always targets the machine actually running this
+	// test rather than a hardcoded architecture.
+	platform := "linux/" + runtime.GOARCH
+	buildCmd := exec.Command("docker", "build", "--platform", platform, "-t", e2eImage, ".")
 	_, err := utils.Run(buildCmd)
 	Expect(err).NotTo(HaveOccurred(), "failed to build manager image")
 
