@@ -17,6 +17,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package e2e exercises the real SelfHealPolicy control loop end to end
+// against an actual kubelet: a kind cluster, the built manager image, and
+// the hand-authored Helm chart. It is excluded from `make test` (which
+// stays Docker-free) via the e2e build tag and is instead run with
+// `make test-e2e` or `go test -tags e2e ./test/e2e/...`.
 package e2e
 
 import (
@@ -31,89 +36,84 @@ import (
 	"github.com/rajanshxrma/sentinel/test/utils"
 )
 
-var (
-	// managerImage is the manager image to be built and loaded for testing.
-	managerImage = "example.com/sentinel:v0.0.1"
-	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
-	shouldCleanupCertManager = false
+const (
+	kindClusterName = "sentinel-e2e"
+	e2eNamespace    = "sentinel-system"
+	e2eImage        = "sentinel:e2e"
+	helmRelease     = "sentinel"
+	chartPath       = "../../charts/sentinel"
 )
 
-// TestE2E runs the e2e test suite to validate the solution in an isolated environment.
-// The default setup requires Kind and CertManager.
-//
-// To enable kubectl kuberc (use custom kubectl configurations), set: KUBECTL_KUBERC=true
-// By default, kuberc is disabled to ensure consistent test behavior across different environments.
-// To skip CertManager installation, set: CERT_MANAGER_INSTALL_SKIP=true
+// keepCluster, when true (E2E_KEEP_CLUSTER=true), skips deleting the kind
+// cluster in AfterSuite — useful when iterating on the suite locally.
+var keepCluster = os.Getenv("E2E_KEEP_CLUSTER") == "true"
+
+// createdCluster tracks whether this suite created the kind cluster (and
+// therefore owns tearing it down) versus reusing one that already existed.
+var createdCluster bool
+
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
-	_, _ = fmt.Fprintf(GinkgoWriter, "Starting sentinel e2e test suite\n")
-	RunSpecs(t, "e2e suite")
+	_, _ = fmt.Fprintf(GinkgoWriter, "Starting sentinel kind e2e suite\n")
+	RunSpecs(t, "sentinel e2e suite")
 }
 
 var _ = BeforeSuite(func() {
+	By("ensuring a kind cluster exists")
+	out, _ := utils.Run(exec.Command("kind", "get", "clusters"))
+	if !containsLine(out, kindClusterName) {
+		By("creating the kind cluster")
+		_, err := utils.Run(exec.Command("kind", "create", "cluster", "--name", kindClusterName))
+		Expect(err).NotTo(HaveOccurred(), "failed to create kind cluster")
+		createdCluster = true
+	} else {
+		_, _ = fmt.Fprintf(GinkgoWriter, "reusing existing kind cluster %q\n", kindClusterName)
+	}
+
 	By("building the manager image")
-	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
-	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager image")
+	buildCmd := exec.Command("docker", "build", "--platform", "linux/arm64", "-t", e2eImage, ".")
+	_, err := utils.Run(buildCmd)
+	Expect(err).NotTo(HaveOccurred(), "failed to build manager image")
 
-	// TODO(user): If you want to change the e2e test vendor from Kind,
-	// ensure the image is built and available, then remove the following block.
-	By("loading the manager image on Kind")
-	err = utils.LoadImageToKindClusterWithName(managerImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
+	By("loading the manager image into kind")
+	loadCmd := exec.Command("kind", "load", "docker-image", e2eImage, "--name", kindClusterName)
+	_, err = utils.Run(loadCmd)
+	Expect(err).NotTo(HaveOccurred(), "failed to load image into kind")
 
-	configureKubectlKubeRC()
-	setupCertManager()
+	By("installing the sentinel helm chart")
+	helmCmd := exec.Command("helm", "upgrade", "--install", helmRelease, chartPath,
+		"--namespace", e2eNamespace,
+		"--create-namespace",
+		"--set", "image.repository=sentinel",
+		"--set", "image.tag=e2e",
+		"--set", "image.pullPolicy=Never",
+		"--set", "metrics.secure=false",
+		"--wait", "--timeout", "120s",
+	)
+	_, err = utils.Run(helmCmd)
+	Expect(err).NotTo(HaveOccurred(), "failed to helm install sentinel")
 })
 
 var _ = AfterSuite(func() {
-	teardownCertManager()
+	By("uninstalling the sentinel helm release")
+	_, _ = utils.Run(exec.Command("helm", "uninstall", helmRelease, "--namespace", e2eNamespace))
+
+	By("deleting the sentinel-system namespace")
+	_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", e2eNamespace, "--ignore-not-found", "--timeout=60s"))
+
+	if createdCluster && !keepCluster {
+		By("deleting the kind cluster")
+		_, _ = utils.Run(exec.Command("kind", "delete", "cluster", "--name", kindClusterName))
+	} else if keepCluster {
+		_, _ = fmt.Fprintf(GinkgoWriter, "E2E_KEEP_CLUSTER=true: leaving kind cluster %q running\n", kindClusterName)
+	}
 })
 
-// Disable kubectl kuberc by default for test isolation.
-// This prevents local kubectl configurations from affecting test behavior.
-// To enable kuberc, set: KUBECTL_KUBERC=true
-func configureKubectlKubeRC() {
-	if os.Getenv("KUBECTL_KUBERC") != "true" {
-		By("disabling kubectl kuberc for test isolation")
-		err := os.Setenv("KUBECTL_KUBERC", "false")
-		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to disable kubectl kuberc")
-		_, _ = fmt.Fprintf(GinkgoWriter,
-			"kubectl kuberc disabled for consistent test behavior (override with KUBECTL_KUBERC=true)\n")
-	} else {
-		_, _ = fmt.Fprintf(GinkgoWriter, "kubectl kuberc enabled (KUBECTL_KUBERC=true)\n")
+func containsLine(output, target string) bool {
+	for _, line := range utils.GetNonEmptyLines(output) {
+		if line == target {
+			return true
+		}
 	}
-}
-
-// setupCertManager installs CertManager if needed for webhook tests.
-// Skips installation if CERT_MANAGER_INSTALL_SKIP=true or if already present.
-func setupCertManager() {
-	if os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true" {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Skipping CertManager installation (CERT_MANAGER_INSTALL_SKIP=true)\n")
-		return
-	}
-
-	By("checking if CertManager is already installed")
-	if utils.IsCertManagerCRDsInstalled() {
-		_, _ = fmt.Fprintf(GinkgoWriter, "CertManager is already installed. Skipping installation.\n")
-		return
-	}
-
-	// Mark for cleanup before installation to handle interruptions and partial installs.
-	shouldCleanupCertManager = true
-
-	By("installing CertManager")
-	Expect(utils.InstallCertManager()).To(Succeed(), "Failed to install CertManager")
-}
-
-// teardownCertManager uninstalls CertManager if it was installed by setupCertManager.
-// This ensures we only remove what we installed.
-func teardownCertManager() {
-	if !shouldCleanupCertManager {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Skipping CertManager cleanup (not installed by this suite)\n")
-		return
-	}
-
-	By("uninstalling CertManager")
-	utils.UninstallCertManager()
+	return false
 }
