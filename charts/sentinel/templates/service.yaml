@@ -1,0 +1,19 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sentinel.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    control-plane: controller-manager
+spec:
+  ports:
+    - name: {{ if .Values.metrics.secure }}https{{ else }}http{{ end }}
+      port: {{ .Values.metrics.port }}
+      protocol: TCP
+      targetPort: {{ .Values.metrics.port }}
+  selector:
+    {{- include "sentinel.selectorLabels" . | nindent 4 }}
+    control-plane: controller-manager
+{{- end }}

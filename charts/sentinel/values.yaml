@@ -1,0 +1,67 @@
+# Default values for the sentinel chart.
+
+replicaCount: 1
+
+image:
+  repository: sentinel
+  tag: "" # defaults to Chart.appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+leaderElection:
+  enabled: true
+
+# metrics controls the controller's metrics endpoint. Secure (HTTPS,
+# self-signed by default) mirrors the kubebuilder default, which is the
+# right default for a cluster running cert-manager; set secure: false for
+# local/kind evaluation where scraping plain HTTP is simpler.
+metrics:
+  enabled: true
+  secure: true
+  port: 8443
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+healthProbe:
+  port: 8081
+
+securityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations: {}
+podLabels: {}
+
+extraArgs: []

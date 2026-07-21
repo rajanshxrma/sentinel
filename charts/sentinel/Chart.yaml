@@ -1,0 +1,17 @@
+apiVersion: v2
+name: sentinel
+description: Self-healing Kubernetes operator — the SelfHealPolicy CRD watches Deployment health and triggers rolling restarts within a cooldown and remediation budget.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/rajanshxrma/sentinel
+sources:
+  - https://github.com/rajanshxrma/sentinel
+keywords:
+  - kubernetes
+  - operator
+  - controller-runtime
+  - self-healing
+  - reliability
+maintainers:
+  - name: rajanshxrma
