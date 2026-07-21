@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070fd419e6f3814f7 # v4.3.0
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        run: make lint
+
+      - name: Check generated manifests are up to date
+        run: |
+          make manifests generate
+          git diff --exit-code -- api/ config/ || \
+            (echo "::error::generated manifests are stale — run 'make manifests generate' and commit the result" && exit 1)
+
+      - name: helm lint
+        run: helm lint charts/sentinel
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run unit + envtest suites
+        run: make test
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa9 # v4.6.2
+        with:
+          name: coverage
+          path: cover.out
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070fd419e6f3814f7 # v4.3.0
+
+      - name: Create kind cluster
+        uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.12.0
+        with:
+          cluster_name: sentinel-e2e
+          wait: 120s
+
+      - name: Build manager image
+        run: docker build -t sentinel:e2e .
+
+      - name: Load image into kind
+        run: kind load docker-image sentinel:e2e --name sentinel-e2e
+
+      - name: Install sentinel chart
+        run: |
+          helm upgrade --install sentinel charts/sentinel \
+            --namespace sentinel-system --create-namespace \
+            --set image.repository=sentinel \
+            --set image.tag=e2e \
+            --set image.pullPolicy=Never \
+            --set metrics.secure=false \
+            --wait --timeout 120s
+
+      - name: Run e2e suite
+        run: go test -tags e2e ./test/e2e/... -v -timeout 20m
+
+      - name: Collect controller logs on failure
+        if: failure()
+        run: |
+          kubectl get pods -n sentinel-system
+          kubectl logs -n sentinel-system -l control-plane=controller-manager --tail=500 || true
+          kubectl get events -n sentinel-system --sort-by=.lastTimestamp || true
