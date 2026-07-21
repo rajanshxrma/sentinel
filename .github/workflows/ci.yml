@@ -24,7 +24,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Setup Helm
-        uses: azure/setup-helm@1a275c3b69536ee54be43f2070fd419e6f3814f7 # v4.3.0
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
 
       - name: go vet
         run: go vet ./...
@@ -61,7 +61,7 @@ jobs:
         run: make test
 
       - name: Upload coverage
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa9 # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage
           path: cover.out
@@ -83,7 +83,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Setup Helm
-        uses: azure/setup-helm@1a275c3b69536ee54be43f2070fd419e6f3814f7 # v4.3.0
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
 
       - name: Create kind cluster
         uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.12.0
