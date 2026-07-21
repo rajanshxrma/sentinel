@@ -1,135 +1,159 @@
 # sentinel
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+**A self-healing Kubernetes operator: watch Deployment health, restart what's broken, and know when to stop.**
 
-## Getting Started
+[![CI](https://github.com/rajanshxrma/sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/rajanshxrma/sentinel/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/go-1.26-00ADD8?logo=go)](go.mod)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+## Why
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+Kubernetes will restart a crashing container forever. That's the problem: `CrashLoopBackOff` is a symptom, not a fix, and a naive "restart it again" script just burns cluster capacity in a loop that never resolves. Sentinel adds the piece Kubernetes doesn't have out of the box — a **remediation budget**. It watches Deployments through a `SelfHealPolicy` custom resource, and when a target crosses its failure threshold, it triggers a real rolling restart (the same mechanism as `kubectl rollout restart`). But it only does that a bounded number of times within a window. Once the budget is exhausted, the target flips to `Degraded` and Sentinel stops touching it — that's the signal that automated remediation isn't the answer anymore and a human needs to look. That safety valve, not the restart itself, is the point of this project.
 
-```sh
-make docker-build docker-push IMG=<some-registry>/sentinel:tag
+Built as a from-scratch, resume-grade controller-runtime project: real reconcile loop, real RBAC, real tests at three layers (unit, envtest, kind e2e), a hand-authored Helm chart, and CI.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    User[Operator / CI] -->|kubectl apply| CR[SelfHealPolicy CR]
+    CR -->|watched by| Ctrl[SelfHealPolicy Controller]
+    Dep[Deployments] -->|watched by| Ctrl
+    Pods[Pods] -->|watched by| Ctrl
+    Ctrl -->|list by selector, walk RS ownership| Pods
+    Ctrl -->|EvaluateHealth pure function| Health[internal/probe]
+    Health -->|restarts / CrashLoopBackOff| Ctrl
+    Ctrl -->|breach + not cooling down + within budget| Patch["Patch pod-template annotation\nsentinel.dev/restartedAt"]
+    Patch --> Dep
+    Ctrl -->|Remediated / WouldRemediate / RemediationBudgetExhausted| Events[Kubernetes Events]
+    Ctrl -->|Targets, Conditions, TotalRemediations| Status[SelfHealPolicy .status]
+    Ctrl -->|remediations_total, targets_degraded, reconcile_duration_seconds| Metrics[Prometheus /metrics]
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+The controller watches three object kinds: the `SelfHealPolicy` itself (`For`), and `Deployment`/`Pod` objects (`Watches` with a selector-matching map function), so it reacts within milliseconds of a real event instead of waiting out the periodic requeue.
 
-**Install the CRDs into the cluster:**
+## CRD reference: `SelfHealPolicy` (apps.sentinel.dev/v1alpha1)
 
-```sh
-make install
-```
+### Spec
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `selector` | `metav1.LabelSelector` | required | Which Deployments in this namespace this policy manages. |
+| `failureThreshold` | `int32` | `3` | Restarts within `observationWindow` (or an active `CrashLoopBackOff`) needed to mark a target unhealthy. |
+| `observationWindow` | `metav1.Duration` | `5m` | Sliding window restarts are counted against. |
+| `cooldown` | `metav1.Duration` | `10m` | Minimum time between two remediations of the same target. |
+| `maxRestarts` | `int32` | `5` | Remediation budget: max remediations per target within `maxRestartsWindow`. |
+| `maxRestartsWindow` | `metav1.Duration` | `1h` | Window the budget is enforced over. |
+| `dryRun` | `bool` | `false` | Evaluate and emit events/metrics, but never patch a Deployment. |
 
-```sh
-make deploy IMG=<some-registry>/sentinel:tag
-```
+### Status
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+| Field | Type | Description |
+|---|---|---|
+| `conditions` | `[]metav1.Condition` | `Ready` (controller is evaluating) and `Degraded` (at least one target exhausted its budget). |
+| `targets` | `[]TargetStatus` | Per-Deployment health/remediation state, rebuilt every reconcile. |
+| `targets[].phase` | enum | One of `Healthy`, `Remediating`, `CoolingDown`, `Degraded`. |
+| `totalRemediations` | `int64` | Lifetime remediation count for the whole policy. |
+| `observedGeneration` | `int64` | Most recent `spec` generation the controller has processed. |
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+## Quickstart
 
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
+Requires `kind`, `helm`, `kubectl`, and Docker.
 
 ```sh
-make uninstall
+# 1. spin up a local cluster
+kind create cluster --name sentinel-demo
+
+# 2. build and load the manager image
+docker build --platform linux/arm64 -t sentinel:dev .
+kind load docker-image sentinel:dev --name sentinel-demo
+
+# 3. install the chart (CRDs included)
+helm upgrade --install sentinel charts/sentinel \
+  --namespace sentinel-system --create-namespace \
+  --set image.repository=sentinel --set image.tag=dev \
+  --set image.pullPolicy=Never --set metrics.secure=false
+
+# 4. deploy something that's going to crash, and a policy to watch it
+kubectl apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crashy-app
+  labels: {app: crashy-app}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: crashy-app}}
+  template:
+    metadata: {labels: {app: crashy-app}}
+    spec:
+      containers:
+        - name: app
+          image: busybox
+          command: ["sh", "-c", "sleep 3600"]
+          livenessProbe:
+            exec: {command: ["cat", "/tmp/healthy"]}
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            failureThreshold: 1
+---
+apiVersion: apps.sentinel.dev/v1alpha1
+kind: SelfHealPolicy
+metadata:
+  name: crashy-app-policy
+spec:
+  selector: {matchLabels: {app: crashy-app}}
+  failureThreshold: 2
+  observationWindow: 2m
+  cooldown: 10s
+  maxRestarts: 2
+  maxRestartsWindow: 5m
+EOF
+
+# 5. watch it heal, then degrade once the budget is spent
+kubectl get selfhealpolicy crashy-app-policy -w
 ```
 
-**UnDeploy the controller from the cluster:**
+## Development
 
 ```sh
-make undeploy
+make manifests generate   # regenerate CRD YAML + DeepCopy code after editing api/
+make test                 # unit (internal/probe) + envtest (internal/controller), no Docker required
+make lint                 # golangci-lint
+make test-e2e              # full kind e2e suite (builds+loads the image, helm installs, asserts real healing)
+make run                  # run the controller against your current kubeconfig, out of cluster
 ```
 
-## Project Distribution
+Unit tests only, with verbose output: `go test ./internal/probe/... -v`.
 
-Following the options to release and provide this solution to the users.
+## Observability
 
-### By providing a bundle with all YAML files
+The manager exposes Prometheus metrics on `:8443` (HTTPS by default, matching the kubebuilder convention; set `metrics.secure=false` in the chart for plain HTTP in dev/kind):
 
-1. Build the installer for the image built and published in the registry:
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `sentinel_remediations_total` | Counter | `namespace`, `policy`, `deployment` | Rolling restarts actually patched (dry-run evaluations are excluded — see below). |
+| `sentinel_targets_degraded` | Gauge | `namespace`, `policy` | Current count of targets in the `Degraded` phase for that policy. |
+| `sentinel_reconcile_duration_seconds` | Histogram | — | Reconcile loop latency. |
 
-```sh
-make build-installer IMG=<some-registry>/sentinel:tag
-```
+Events emitted on the `SelfHealPolicy` object: `Remediated`, `WouldRemediate` (dry-run), `RemediationFailed`, `RemediationBudgetExhausted`.
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+## Design decisions and tradeoffs
 
-2. Using the installer
+- **kubebuilder scaffold, not hand-rolled.** The canonical `kubebuilder init` / `create api` layout is itself part of the signal for an infra-hiring audience familiar with controller-runtime conventions — it's the shape reviewers expect to open.
+- **In-memory ledger + Status as durable mirror.** Cooldown and budget checks read a mutex-guarded, in-process map (`internal/controller/ledger.go`) instead of round-tripping through the API server on every check. `Status.Targets[].RemediationCount`/`LastRemediation` is the durable record; on a controller restart, the ledger is seeded from the last known Status the first time a target is reconciled. The real tradeoff: a restart resets the ledger's precise timestamp history to a single seeded point, so cooldown timing right after a restart is an approximation, but the remediation *count* the budget enforces is never lost.
+- **No finalizer.** The controller only ever annotation-patches Deployments it doesn't own; there's no owned/created resource to clean up on delete, so a finalizer would add complexity without a corresponding cleanup responsibility.
+- **The Degraded safety-valve is the point.** Any script can restart a crashing pod. The differentiator here is refusing to do it forever: once a target's remediation count within `maxRestartsWindow` reaches `maxRestarts`, the controller stops — no more patches, no more restarts — and flips the target `Degraded` with a `RemediationBudgetExhausted` event so the failure surfaces to a human instead of quietly consuming cluster capacity.
+- **Pod discovery walks Deployment → ReplicaSet → Pod ownership**, not a label-match shortcut, so a stale ReplicaSet left behind by a prior rollout (which can still carry matching labels) is never mistaken for a live target.
+- **CrashLoopBackOff counts unconditionally; timestamped restarts are windowed.** Kubernetes only reports a cumulative restart count and the timestamp of the *last* restart per container, not full history, so `internal/probe.EvaluateHealth` only counts a container's restarts toward the window if its most recent restart falls inside it — a container that crashed many times long ago and has since stabilized contributes nothing. An active `CrashLoopBackOff` waiting state is always counted, since it's happening right now by definition.
 
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
+## Roadmap
 
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/sentinel/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+- Sync the Helm chart's `crds/` copy from `config/crd/bases/` automatically (currently a manual copy step after `make manifests`).
+- Optional webhook for spec validation (e.g. `maxRestarts >= 1`) at admission time instead of only via CRD OpenAPI schema.
+- Per-target override of thresholds via Deployment annotations, for policies that span heterogeneous workloads.
+- Auto-recovery path: currently `Degraded` is sticky until the operator's `maxRestartsWindow` naturally ages the count back down; consider an explicit `kubectl annotate ... sentinel.dev/reset=true` escape hatch.
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+MIT — see [LICENSE](LICENSE).
