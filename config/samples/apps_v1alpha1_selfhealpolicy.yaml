@@ -1,0 +1,9 @@
+apiVersion: apps.sentinel.dev/v1alpha1
+kind: SelfHealPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: sentinel
+    app.kubernetes.io/managed-by: kustomize
+  name: selfhealpolicy-sample
+spec:
+  # TODO(user): Add fields here
