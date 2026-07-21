@@ -15,12 +15,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const testContainerName = "app"
+
 func podWithRestart(restarts int32, finishedAt time.Time) corev1.Pod {
 	return corev1.Pod{
 		Status: corev1.PodStatus{
 			ContainerStatuses: []corev1.ContainerStatus{
 				{
-					Name:         "app",
+					Name:         testContainerName,
 					RestartCount: restarts,
 					LastTerminationState: corev1.ContainerState{
 						Terminated: &corev1.ContainerStateTerminated{
@@ -38,7 +40,7 @@ func podCrashLooping(restarts int32) corev1.Pod {
 		Status: corev1.PodStatus{
 			ContainerStatuses: []corev1.ContainerStatus{
 				{
-					Name:         "app",
+					Name:         testContainerName,
 					RestartCount: restarts,
 					State: corev1.ContainerState{
 						Waiting: &corev1.ContainerStateWaiting{
@@ -56,7 +58,7 @@ func podHealthy() corev1.Pod {
 		Status: corev1.PodStatus{
 			ContainerStatuses: []corev1.ContainerStatus{
 				{
-					Name:         "app",
+					Name:         testContainerName,
 					RestartCount: 0,
 					State: corev1.ContainerState{
 						Running: &corev1.ContainerStateRunning{},
@@ -198,7 +200,7 @@ func Benchmark_EvaluateHealth(b *testing.B) {
 	window := 5 * time.Minute
 
 	pods := make([]corev1.Pod, 0, 50)
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		if i%5 == 0 {
 			pods = append(pods, podCrashLooping(int32(i%7+1)))
 		} else if i%3 == 0 {

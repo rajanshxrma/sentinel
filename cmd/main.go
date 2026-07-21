@@ -170,9 +170,14 @@ func main() {
 	}
 
 	if err := (&controller.SelfHealPolicyReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("selfhealpolicy-controller"),
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		// GetEventRecorder returns a different interface (events.EventRecorder
+		// vs record.EventRecorder), which would require migrating every
+		// Recorder.Event/Eventf call site in the reconciler -- out of scope
+		// for a lint fix. controller-runtime's own test suite suppresses this
+		// identical deprecation the same way.
+		Recorder: mgr.GetEventRecorderFor("selfhealpolicy-controller"), //nolint:staticcheck
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "selfhealpolicy")
 		os.Exit(1)

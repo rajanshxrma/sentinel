@@ -90,7 +90,7 @@ var _ = BeforeSuite(func() {
 	reconciler := &SelfHealPolicyReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("selfhealpolicy-controller-test"),
+		Recorder: mgr.GetEventRecorderFor("selfhealpolicy-controller-test"), //nolint:staticcheck
 		Ledger:   newTargetLedger(),
 	}
 	Expect(reconciler.SetupWithManager(mgr)).To(Succeed())

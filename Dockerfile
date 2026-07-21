@@ -6,7 +6,13 @@
 # older toolchain simply can't compile a go-1.26-declared module.
 FROM golang:1.26 AS builder
 ARG TARGETOS=linux
-ARG TARGETARCH=arm64
+# No hardcoded default here: BuildKit auto-populates TARGETARCH from the
+# actual build platform (arm64 on Apple Silicon dev machines, amd64 on
+# GitHub Actions runners). A hardcoded `=arm64` default previously
+# overrode that auto-detection on every build that doesn't pass
+# --build-arg explicitly (i.e. every CI build), producing an arm64 binary
+# that failed with "exec format error" on the CI runner's amd64 kernel.
+ARG TARGETARCH
 
 WORKDIR /workspace
 

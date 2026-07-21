@@ -252,10 +252,7 @@ func (r *SelfHealPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("update status: %w", err)
 	}
 
-	requeueAfter := policy.Spec.ObservationWindow.Duration
-	if policy.Spec.Cooldown.Duration < requeueAfter {
-		requeueAfter = policy.Spec.Cooldown.Duration
-	}
+	requeueAfter := min(policy.Spec.ObservationWindow.Duration, policy.Spec.Cooldown.Duration)
 
 	if len(reconcileErrs) > 0 {
 		return ctrl.Result{RequeueAfter: requeueAfter}, reconcileErrs[0]

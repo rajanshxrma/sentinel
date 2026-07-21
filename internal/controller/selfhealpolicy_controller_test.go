@@ -25,14 +25,19 @@ import (
 	appsv1alpha1 "github.com/rajanshxrma/sentinel/api/v1alpha1"
 )
 
-const testNamespace = "default"
+const (
+	testNamespace  = "default"
+	labelKeyApp    = "app"
+	containerName  = "app"
+	containerImage = "busybox"
+)
 
-var fixtureCounter int64
+var fixtureCounter atomic.Int64
 
 // uniqueName returns a per-test-run unique name so parallel-safe It blocks
 // never collide on Deployment/ReplicaSet/Pod/SelfHealPolicy names.
 func uniqueName(prefix string) string {
-	n := atomic.AddInt64(&fixtureCounter, 1)
+	n := fixtureCounter.Add(1)
 	return fmt.Sprintf("%s-%d", prefix, n)
 }
 
@@ -44,7 +49,7 @@ func int32Ptr(i int32) *int32 { return &i }
 // Deployment/ReplicaSet controller running in envtest, so the ownership
 // chain the reconciler walks is built by hand here.
 func crashLoopingTarget(ctx context.Context, name string, restartCount int32) *appsv1.Deployment {
-	labels := map[string]string{"app": name}
+	labels := map[string]string{labelKeyApp: name}
 
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, Labels: labels},
@@ -53,7 +58,7 @@ func crashLoopingTarget(ctx context.Context, name string, restartCount int32) *a
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
-				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: containerName, Image: containerImage}}},
 			},
 		},
 	}
@@ -71,7 +76,7 @@ func crashLoopingTarget(ctx context.Context, name string, restartCount int32) *a
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
-				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: containerName, Image: containerImage}}},
 			},
 		},
 	}
@@ -84,7 +89,7 @@ func crashLoopingTarget(ctx context.Context, name string, restartCount int32) *a
 			Labels:          labels,
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(rs, appsv1.SchemeGroupVersion.WithKind("ReplicaSet"))},
 		},
-		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: containerName, Image: containerImage}}},
 	}
 	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 
@@ -92,7 +97,7 @@ func crashLoopingTarget(ctx context.Context, name string, restartCount int32) *a
 		Phase: corev1.PodRunning,
 		ContainerStatuses: []corev1.ContainerStatus{
 			{
-				Name:         "app",
+				Name:         containerName,
 				RestartCount: restartCount,
 				State: corev1.ContainerState{
 					Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
@@ -117,7 +122,7 @@ var _ = Describe("SelfHealPolicy Controller", func() {
 	Context("when a target breaches its failure threshold", func() {
 		It("patches restartedAt, increments TotalRemediations, and respects cooldown", func() {
 			name := uniqueName("remediate")
-			labels := map[string]string{"app": name}
+			labels := map[string]string{labelKeyApp: name}
 
 			deploy := crashLoopingTarget(ctx, name, 5)
 			DeferCleanup(func() { _ = k8sClient.Delete(ctx, deploy) })
@@ -166,7 +171,7 @@ var _ = Describe("SelfHealPolicy Controller", func() {
 	Context("when a target exhausts its remediation budget", func() {
 		It("flips to Degraded and stops remediating", func() {
 			name := uniqueName("degrade")
-			labels := map[string]string{"app": name}
+			labels := map[string]string{labelKeyApp: name}
 
 			deploy := crashLoopingTarget(ctx, name, 5)
 			DeferCleanup(func() { _ = k8sClient.Delete(ctx, deploy) })
@@ -218,7 +223,7 @@ var _ = Describe("SelfHealPolicy Controller", func() {
 	Context("when dryRun is enabled", func() {
 		It("evaluates the target but never patches the deployment", func() {
 			name := uniqueName("dryrun")
-			labels := map[string]string{"app": name}
+			labels := map[string]string{labelKeyApp: name}
 
 			deploy := crashLoopingTarget(ctx, name, 5)
 			DeferCleanup(func() { _ = k8sClient.Delete(ctx, deploy) })
