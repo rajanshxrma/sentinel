@@ -33,7 +33,15 @@ const (
 	e2eNamespace    = "sentinel-system"
 	e2eImage        = "sentinel:e2e"
 	helmRelease     = "sentinel"
-	chartPath       = "../../charts/sentinel"
+	// Relative to the project root, not to this package's source
+	// directory: utils.Run chdirs the process to the project root (via
+	// GetProjectDir) before every command it runs, starting with the very
+	// first "kind get clusters" call in BeforeSuite -- so by the time this
+	// path is used, the working directory is already the project root,
+	// not test/e2e. A "../../charts/sentinel"-style path (correct only
+	// relative to test/e2e) resolves outside the repo entirely once that
+	// chdir has happened.
+	chartPath = "charts/sentinel"
 )
 
 // keepCluster, when true (E2E_KEEP_CLUSTER=true), skips deleting the kind
